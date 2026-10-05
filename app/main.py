@@ -6,12 +6,11 @@ import io
 import logging
 import secrets
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
@@ -26,6 +25,7 @@ from .security import Vault, hash_password, load_secret, verify_password
 
 log = logging.getLogger("hmcscan")
 STATIC = Path(__file__).parent / "static"
+ADMIN_STATIC = Path(__file__).parent / "admin_static"
 VERSION = "1.0.0"
 
 
@@ -106,27 +106,31 @@ class ADTestIn(BaseModel):
 
 # ---------- app factory ----------
 
-def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastAPI:
-    data_dir = Path(data_dir or config.DATA_DIR)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    db = DB(data_dir / "hmcscan.db")
-    secret = load_secret(data_dir, config.SECRET_KEY)
-    vault = Vault(secret)
-    _bootstrap(db, vault)
+class Context:
+    """State shared by the viewer and the admin interface: one database, one poller."""
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        app.state.poller = Poller(db, vault)
-        if start_poller:
-            app.state.poller.start()
-        yield
-        await app.state.poller.stop()
+    def __init__(self, data_dir: Path | None = None):
+        self.data_dir = Path(data_dir or config.DATA_DIR)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db = DB(self.data_dir / "hmcscan.db")
+        self.secret = load_secret(self.data_dir, config.SECRET_KEY)
+        self.vault = Vault(self.secret)
+        _bootstrap(self.db, self.vault)
+        self.poller = Poller(self.db, self.vault)
+        self.failures: dict[str, list[float]] = {}
 
-    app = FastAPI(title="HMCscan", version=VERSION, lifespan=lifespan, docs_url=None, redoc_url=None)
-    app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie="hmcscan",
+
+def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> FastAPI:
+    """kind="public": read-only viewer. kind="admin": HMC, datacenter, user and AD management."""
+    db, vault = ctx.db, ctx.vault
+    is_admin_app = kind == "admin"
+    app = FastAPI(title="HMCscan" + (" admin" if is_admin_app else ""), version=VERSION, docs_url=None, redoc_url=None)
+    # Browsers share cookies between ports of one host, so the two interfaces use different cookie names.
+    app.add_middleware(SessionMiddleware, secret_key=ctx.secret + kind, session_cookie="hmcscan_admin" if is_admin_app else "hmcscan",
                        max_age=config.SESSION_HOURS * 3600, same_site="strict", https_only=config.TLS)
-    app.state.db, app.state.vault = db, vault
-    failures: dict[str, list[float]] = {}
+    app.state.db, app.state.vault, app.state.poller = db, vault, ctx.poller
+    failures = ctx.failures
+    pub, adm = APIRouter(), APIRouter()
 
     # ----- auth helpers -----
     def current_user(request: Request) -> dict:
@@ -205,6 +209,8 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             raise HTTPException(401, "Неверный логин или пароль")
         if not user["enabled"]:
             raise HTTPException(403, "Учётная запись заблокирована администратором")
+        if is_admin_app and user["role"] != "admin":
+            raise HTTPException(403, "В администрирование могут войти только пользователи с ролью «Администратор»")
         failures.pop(key, None)
         db.run("UPDATE users SET last_login=? WHERE id=?", now_iso(), user["id"])
         request.session.clear()
@@ -221,7 +227,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
         return user
 
     # ----- inventory -----
-    @app.get("/api/overview")
+    @pub.get("/api/overview")
     def get_overview(request: Request, _: dict = Depends(current_user)):
         data = inventory.overview(inventory.load(db))
         poller: Poller = request.app.state.poller
@@ -229,27 +235,27 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             h["polling"] = poller.is_running(h["id"])
         return data
 
-    @app.get("/api/hmcs/{hmc_id}/servers")
+    @pub.get("/api/hmcs/{hmc_id}/servers")
     def get_hmc_servers(hmc_id: int, _: dict = Depends(current_user)):
         data = inventory.hmc_servers(inventory.load(db), hmc_id)
         if data is None:
             raise HTTPException(404, "HMC не найдена")
         return data
 
-    @app.get("/api/servers/{key}")
+    @pub.get("/api/servers/{key}")
     def get_server(key: str, _: dict = Depends(current_user)):
         data = inventory.server_detail(inventory.load(db), key)
         if data is None:
             raise HTTPException(404, "Сервер не найден")
         return data
 
-    @app.get("/api/lpars")
+    @pub.get("/api/lpars")
     def get_lpars(_: dict = Depends(current_user)):
         inv = inventory.load(db)
         return {"dcs": inv.dcs, "hmcs": [{"id": h["id"], "name": h["name"]} for h in inv.hmcs],
                 "lpars": inventory.all_lpars(inv)}
 
-    @app.get("/api/export/lpars.csv")
+    @pub.get("/api/export/lpars.csv")
     def export_csv(_: dict = Depends(current_user)):
         rows = inventory.all_lpars(inventory.load(db))
         buf = io.StringIO()
@@ -271,30 +277,30 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
         return Response("﻿" + buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
-    @app.post("/api/poll")
+    @adm.post("/api/poll")
     async def poll_all(request: Request, _: dict = Depends(admin)):
         return {"started": request.app.state.poller.trigger_all()}
 
     # ----- admin: datacenters -----
-    @app.get("/api/admin/datacenters")
+    @adm.get("/api/admin/datacenters")
     def list_dcs(_: dict = Depends(admin)):
         return db.all("SELECT d.*, (SELECT COUNT(*) FROM hmcs h WHERE h.dc_id=d.id) AS hmc_count "
                       "FROM datacenters d ORDER BY d.code")
 
-    @app.post("/api/admin/datacenters", status_code=201)
+    @adm.post("/api/admin/datacenters", status_code=201)
     def create_dc(body: DCIn, _: dict = Depends(admin)):
         if db.one("SELECT 1 FROM datacenters WHERE code=?", body.code):
             raise HTTPException(409, f"ЦОД с кодом {body.code} уже есть")
         return {"id": db.run("INSERT INTO datacenters(code,name,address) VALUES(?,?,?)", body.code, body.name, body.address)}
 
-    @app.put("/api/admin/datacenters/{dc_id}")
+    @adm.put("/api/admin/datacenters/{dc_id}")
     def update_dc(dc_id: int, body: DCIn, _: dict = Depends(admin)):
         if db.one("SELECT 1 FROM datacenters WHERE code=? AND id<>?", body.code, dc_id):
             raise HTTPException(409, f"ЦОД с кодом {body.code} уже есть")
         db.run("UPDATE datacenters SET code=?, name=?, address=? WHERE id=?", body.code, body.name, body.address, dc_id)
         return {"ok": True}
 
-    @app.delete("/api/admin/datacenters/{dc_id}")
+    @adm.delete("/api/admin/datacenters/{dc_id}")
     def delete_dc(dc_id: int, _: dict = Depends(admin)):
         n = db.one("SELECT COUNT(*) AS n FROM hmcs WHERE dc_id=?", dc_id)["n"]
         if n:
@@ -311,7 +317,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
         if body.tls_mode == "ca" and "BEGIN CERTIFICATE" not in body.ca_pem:
             raise HTTPException(422, "Для проверки по своему CA вставьте сертификат в формате PEM")
 
-    @app.get("/api/admin/hmcs")
+    @adm.get("/api/admin/hmcs")
     def list_hmcs(request: Request, _: dict = Depends(admin)):
         rows = db.all("SELECT h.id, h.name, h.host, h.port, h.dc_id, h.username, h.tls_mode, h.ca_pem, h.interval_min, "
                       "h.enabled, s.status, s.error, s.attempted_at, s.polled_at, s.duration_s "
@@ -323,7 +329,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             r["polling"] = request.app.state.poller.is_running(r["id"])
         return rows
 
-    @app.post("/api/admin/hmcs", status_code=201)
+    @adm.post("/api/admin/hmcs", status_code=201)
     async def create_hmc(body: HMCIn, request: Request, _: dict = Depends(admin)):
         _check_hmc(body, None)
         if not body.password:
@@ -335,7 +341,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             request.app.state.poller.trigger(hid)
         return {"id": hid}
 
-    @app.put("/api/admin/hmcs/{hmc_id}")
+    @adm.put("/api/admin/hmcs/{hmc_id}")
     async def update_hmc(hmc_id: int, body: HMCIn, request: Request, _: dict = Depends(admin)):
         if not db.one("SELECT 1 FROM hmcs WHERE id=?", hmc_id):
             raise HTTPException(404, "HMC не найдена")
@@ -349,12 +355,12 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             request.app.state.poller.trigger(hmc_id)
         return {"ok": True}
 
-    @app.delete("/api/admin/hmcs/{hmc_id}")
+    @adm.delete("/api/admin/hmcs/{hmc_id}")
     def delete_hmc(hmc_id: int, _: dict = Depends(admin)):
         db.run("DELETE FROM hmcs WHERE id=?", hmc_id)
         return {"ok": True}
 
-    @app.post("/api/admin/hmcs/test")
+    @adm.post("/api/admin/hmcs/test")
     async def test_hmc(body: HMCTestIn, _: dict = Depends(admin)):
         password = body.password
         if not password and body.id:
@@ -370,7 +376,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
                 "lpars": sum(len(s["lpars"]) for s in data["systems"]), "warnings": data["warnings"],
                 "duration_s": data["duration_s"]}
 
-    @app.post("/api/admin/hmcs/{hmc_id}/poll")
+    @adm.post("/api/admin/hmcs/{hmc_id}/poll")
     async def poll_one(hmc_id: int, request: Request, _: dict = Depends(admin)):
         return {"started": request.app.state.poller.trigger(hmc_id)}
 
@@ -378,12 +384,12 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
     def _admins_left(excluding: int) -> int:
         return db.one("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND enabled=1 AND id<>?", excluding)["n"]
 
-    @app.get("/api/admin/users")
+    @adm.get("/api/admin/users")
     def list_users(_: dict = Depends(admin)):
         return db.all("SELECT id, login, name, source, role, role_locked, enabled, via_group, last_login "
                       "FROM users ORDER BY source DESC, login")
 
-    @app.post("/api/admin/users", status_code=201)
+    @adm.post("/api/admin/users", status_code=201)
     def create_user(body: UserIn, _: dict = Depends(admin)):
         if db.one("SELECT 1 FROM users WHERE login=?", body.login.strip()):
             raise HTTPException(409, "Пользователь с таким логином уже есть")
@@ -393,7 +399,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
                      body.login.strip(), body.name.strip(), "local", body.role, hash_password(body.password), int(body.enabled))
         return {"id": uid}
 
-    @app.put("/api/admin/users/{uid}")
+    @adm.put("/api/admin/users/{uid}")
     def update_user(uid: int, body: UserIn, me_: dict = Depends(admin)):
         row = db.one("SELECT * FROM users WHERE id=?", uid)
         if not row:
@@ -411,7 +417,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             db.run("UPDATE users SET pw_hash=? WHERE id=?", hash_password(body.password), uid)
         return {"ok": True}
 
-    @app.delete("/api/admin/users/{uid}")
+    @adm.delete("/api/admin/users/{uid}")
     def delete_user(uid: int, me_: dict = Depends(admin)):
         if uid == me_["id"]:
             raise HTTPException(409, "Нельзя удалить самого себя")
@@ -422,7 +428,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
         return {"ok": True}
 
     # ----- admin: Active Directory -----
-    @app.get("/api/admin/ad")
+    @adm.get("/api/admin/ad")
     def get_ad(_: dict = Depends(admin)):
         ad = DEFAULT_AD | db.get_setting("ad", {})
         out = {k: v for k, v in ad.items() if k != "bind_password_enc"}
@@ -433,7 +439,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
             g["users"] = counts.get(g["dn"].split(",")[0].removeprefix("CN=").removeprefix("cn=").lower(), 0)
         return out
 
-    @app.put("/api/admin/ad")
+    @adm.put("/api/admin/ad")
     def put_ad(body: ADIn, _: dict = Depends(admin)):
         cur = DEFAULT_AD | db.get_setting("ad", {})
         new = body.model_dump(exclude={"bind_password"})
@@ -449,7 +455,7 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
         db.set_setting("ad", new)
         return {"ok": True}
 
-    @app.post("/api/admin/ad/test")
+    @adm.post("/api/admin/ad/test")
     async def test_ad(body: ADTestIn, _: dict = Depends(admin)):
         ad = DEFAULT_AD | db.get_setting("ad", {})
         try:
@@ -462,7 +468,21 @@ def create_app(data_dir: Path | None = None, start_poller: bool = True) -> FastA
         return {"ok": True, "login": u.login, "name": u.name, "dn": u.dn, "groups": u.groups[:50],
                 "role": u.role, "via_group": u.via_group, "password_checked": bool(body.password)}
 
-    app.mount("/", StaticFiles(directory=STATIC, html=True), name="ui")
+    if kind == "public":
+        app.include_router(pub)
+        app.mount("/", StaticFiles(directory=STATIC, html=True), name="ui")
+    else:
+        app.include_router(adm)
+
+        @app.get("/app.css", include_in_schema=False)
+        def shared_css():
+            return FileResponse(STATIC / "app.css", media_type="text/css")
+
+        @app.get("/common.js", include_in_schema=False)
+        def shared_js():
+            return FileResponse(STATIC / "common.js", media_type="text/javascript")
+
+        app.mount("/", StaticFiles(directory=ADMIN_STATIC, html=True), name="admin-ui")
     return app
 
 
