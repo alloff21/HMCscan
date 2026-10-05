@@ -9,14 +9,29 @@ from app.poller import Poller
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def ctx(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "TLS", False)
     monkeypatch.setattr(config, "DEMO", True)
     monkeypatch.setattr(config, "ADMIN_PASSWORD", "admin-pass-1")
+    from app.main import Context
+    return Context(tmp_path)
+
+
+@pytest.fixture()
+def client(ctx):
+    """The read-only viewer interface."""
     from app.main import create_app
-    app = create_app(tmp_path, start_poller=False)
-    with TestClient(app) as c:
-        c.app_ref = app
+    with TestClient(create_app(ctx, "public")) as c:
+        c.ctx = ctx
+        yield c
+
+
+@pytest.fixture()
+def admin_client(ctx):
+    """The administration interface (separate port in production)."""
+    from app.main import create_app
+    with TestClient(create_app(ctx, "admin")) as c:
+        c.ctx = ctx
         yield c
 
 
@@ -25,9 +40,8 @@ def login(c, user="admin", pw="admin-pass-1"):
 
 
 def poll_all(c):
-    app = c.app_ref
-    p = Poller(app.state.db, app.state.vault)
-    for h in app.state.db.all("SELECT id FROM hmcs"):
+    p = Poller(c.ctx.db, c.ctx.vault)
+    for h in c.ctx.db.all("SELECT id FROM hmcs"):
         asyncio.run(p.poll(h["id"]))
 
 
@@ -56,7 +70,8 @@ def test_inventory_after_poll(client):
     assert csv.status_code == 200 and csv.text.count("\n") == len(lpars) + 1
 
 
-def test_hmc_requires_datacenter(client):
+def test_hmc_requires_datacenter(admin_client):
+    client = admin_client
     login(client)
     body = {"name": "hmc-x", "host": "hmc-x.demo", "username": "u", "password": "p"}
     r = client.post("/api/admin/hmcs", json=body)
@@ -69,23 +84,42 @@ def test_hmc_requires_datacenter(client):
     assert all("password_enc" not in h for h in listed)
 
 
-def test_viewer_cannot_admin(client):
+def test_viewer_interface_is_read_only(client):
     login(client)
-    assert client.post("/api/admin/users", json={"login": "viewer1", "password": "viewer-pass", "role": "viewer"}).status_code == 201
-    client.post("/api/auth/logout")
+    paths = [("GET", "/api/admin/hmcs"), ("POST", "/api/admin/hmcs"), ("GET", "/api/admin/users"),
+             ("PUT", "/api/admin/ad"), ("POST", "/api/poll"), ("POST", "/api/admin/datacenters")]
+    for method, path in paths:
+        assert client.request(method, path, json={}).status_code in (404, 405), path
+    assert "admin.js" not in client.get("/").text
+    assert client.get("/admin.js").status_code == 404
+
+
+def test_admin_interface(admin_client, client):
+    login(admin_client)
+    assert admin_client.post("/api/admin/users", json={"login": "viewer1", "password": "viewer-pass", "role": "viewer"}).status_code == 201
+    assert "admin.js" in admin_client.get("/").text
+    assert admin_client.get("/app.css").status_code == 200 and admin_client.get("/common.js").status_code == 200
+    # a viewer can use the viewer interface but cannot sign in to administration
     assert login(client, "viewer1", "viewer-pass").status_code == 200
     assert client.get("/api/overview").status_code == 200
-    assert client.get("/api/admin/hmcs").status_code == 403
+    admin_client.post("/api/auth/logout")
+    assert login(admin_client, "viewer1", "viewer-pass").status_code == 403
+    assert admin_client.get("/api/admin/hmcs").status_code == 401
+    # inventory pages are not part of the admin interface
+    login(admin_client)
+    assert admin_client.get("/api/overview").status_code == 404
 
 
-def test_last_admin_is_protected(client):
+def test_last_admin_is_protected(admin_client):
+    client = admin_client
     login(client)
     me = client.get("/api/auth/me").json()
     r = client.put(f"/api/admin/users/{me['id']}", json={"login": "admin", "role": "viewer"})
     assert r.status_code == 409
 
 
-def test_ad_settings_keep_password(client):
+def test_ad_settings_keep_password(admin_client):
+    client = admin_client
     login(client)
     cfg = {"enabled": True, "servers": "ldaps://dc1:636", "base_dn": "DC=corp,DC=local",
            "bind_dn": "CN=svc,DC=corp,DC=local", "bind_password": "secret",

@@ -240,4 +240,4 @@ pre.code .c{color:#7d8a97}
 @media (max-width:760px){.grouprow{grid-template-columns:1fr}}
 [hidden]{display:none!important}
 .field input[type=checkbox],.check input{width:auto;flex:none}
-@media (max-width:1400px){.grid2{grid-template-columns:1fr}}
+@media (max-width:1600px){.grid2{grid-template-columns:1fr}}

@@ -8,7 +8,10 @@ def _flag(name: str, default: str) -> bool:
 
 
 DATA_DIR = Path(os.getenv("HMCSCAN_DATA_DIR", "/data"))
-PORT = int(os.getenv("HMCSCAN_PORT", "8843"))
+PORT = int(os.getenv("HMCSCAN_PORT", "8843"))              # read-only viewer
+ADMIN_PORT = int(os.getenv("HMCSCAN_ADMIN_PORT", "8844"))  # administration
+# Address the admin interface listens on inside the container, e.g. 127.0.0.1 to keep it local.
+ADMIN_BIND = os.getenv("HMCSCAN_ADMIN_BIND", "0.0.0.0")
 TLS = _flag("HMCSCAN_TLS", "1")
 SECRET_KEY = os.getenv("HMCSCAN_SECRET_KEY", "")
 ADMIN_PASSWORD = os.getenv("HMCSCAN_ADMIN_PASSWORD", "")

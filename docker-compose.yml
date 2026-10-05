@@ -5,7 +5,8 @@ services:
     container_name: hmcscan
     restart: unless-stopped
     ports:
-      - "8843:8843"
+      - "8843:8843"   # просмотр (только чтение)
+      - "8844:8844"   # администрирование; можно открыть только для себя: "127.0.0.1:8844:8844"
     volumes:
       - hmcscan-data:/data
     environment:
