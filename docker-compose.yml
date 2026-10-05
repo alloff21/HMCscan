@@ -1,0 +1,20 @@
+services:
+  hmcscan:
+    image: ghcr.io/alloff21/hmcscan:latest
+    # build: .            # or build the image locally
+    container_name: hmcscan
+    restart: unless-stopped
+    ports:
+      - "8843:8843"
+    volumes:
+      - hmcscan-data:/data
+    environment:
+      # Key that encrypts stored HMC and AD passwords. Set it once and keep it.
+      HMCSCAN_SECRET_KEY: "change-me-to-a-long-random-string"
+      # Password of the built-in "admin" user on the first start.
+      HMCSCAN_ADMIN_PASSWORD: "change-me"
+      TZ: Europe/Moscow
+      # HMCSCAN_DEMO: "1"   # fake HMCs with test data, to try the UI
+
+volumes:
+  hmcscan-data:
