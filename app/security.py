@@ -32,6 +32,8 @@ def verify_password(password: str, stored: str) -> bool:
 def load_secret(data_dir: Path, from_env: str) -> str:
     """Use HMCSCAN_SECRET_KEY if given, otherwise a key generated once into the data volume."""
     if from_env:
+        if len(from_env) < 32 or from_env in {"change-me-to-a-long-random-string"}:
+            raise RuntimeError("HMCSCAN_SECRET_KEY must be a random secret of at least 32 characters")
         return from_env
     path = data_dir / "secret.key"
     if path.exists():
