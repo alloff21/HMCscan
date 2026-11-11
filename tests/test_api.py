@@ -135,3 +135,38 @@ def test_role_mapping_takes_highest():
     mapping = [{"dn": "CN=Viewers,DC=c", "role": "viewer"}, {"dn": "CN=Admins,DC=c", "role": "admin"}]
     assert map_role(["cn=viewers,dc=c", "CN=Admins,DC=c"], mapping) == ("admin", "Admins")
     assert map_role(["CN=Other,DC=c"], mapping) == (None, "")
+
+
+def test_user_update_invalid_password_does_not_change_role(admin_client):
+    c = admin_client
+    assert login(c).status_code == 200
+    uid = c.post("/api/admin/users", json={"login": "atomic", "password": "safe-pass-123", "role": "viewer"}).json()["id"]
+    bad = c.put(f"/api/admin/users/{uid}", json={
+        "login": "atomic", "role": "admin", "password": "short", "enabled": True})
+    assert bad.status_code == 422
+    user = next(u for u in c.get("/api/admin/users").json() if u["id"] == uid)
+    assert user["role"] == "viewer"
+
+
+def test_cross_origin_mutation_rejected(admin_client):
+    c = admin_client
+    assert login(c).status_code == 200
+    r = c.post("/api/admin/datacenters", headers={"Origin": "https://attacker.example"},
+               json={"code": "X", "name": "Bad"})
+    assert r.status_code == 403
+
+
+def test_disabled_hmc_cannot_be_polled(admin_client):
+    c = admin_client
+    assert login(c).status_code == 200
+    hid = c.ctx.db.one("SELECT id FROM hmcs LIMIT 1")["id"]
+    c.ctx.db.run("UPDATE hmcs SET enabled=0 WHERE id=?", hid)
+    assert c.post(f"/api/admin/hmcs/{hid}/poll").json()["started"] is False
+
+
+def test_login_rate_limit_across_usernames(client):
+    for i in range(30):
+        r = client.post("/api/auth/login", json={"login": f"bad{i}", "password": "wrong", "source": "local"})
+        assert r.status_code == 401
+    r = client.post("/api/auth/login", json={"login": "newuser", "password": "wrong", "source": "local"})
+    assert r.status_code == 429
