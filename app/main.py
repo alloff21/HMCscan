@@ -146,15 +146,34 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
             raise HTTPException(403, "Нужна роль «Администратор»")
         return user
 
-    def throttle(key: str) -> None:
+    def throttle(key: str, ip: str) -> None:
         now = time.monotonic()
-        recent = [t for t in failures.get(key, []) if now - t < 300]
-        failures[key] = recent
-        if len(recent) >= 5:
+        # Apply both per-account and per-IP limits; bound memory use by pruning.
+        for k in list(failures):
+            failures[k] = [t for t in failures[k] if now - t < 300]
+            if not failures[k]:
+                del failures[k]
+        if len(failures.get(key, [])) >= 5 or len(failures.get("ip:" + ip, [])) >= 30:
             raise HTTPException(429, "Слишком много неудачных попыток. Подождите 5 минут.")
+
+    def record_failure(key: str, ip: str) -> None:
+        now = time.monotonic()
+        failures.setdefault(key, []).append(now)
+        failures.setdefault("ip:" + ip, []).append(now)
 
     @app.middleware("http")
     async def no_cache_api(request: Request, call_next):
+        if request.url.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = request.headers.get("origin")
+            if origin:
+                from urllib.parse import urlsplit
+                try:
+                    parsed = urlsplit(origin)
+                    expected = urlsplit(str(request.base_url))
+                    if (parsed.scheme, parsed.netloc) != (expected.scheme, expected.netloc):
+                        return JSONResponse({"detail": "Недопустимый Origin"}, status_code=403)
+                except ValueError:
+                    return JSONResponse({"detail": "Недопустимый Origin"}, status_code=403)
         resp = await call_next(request)
         if request.url.path.startswith("/api/"):
             resp.headers["Cache-Control"] = "no-store"
@@ -174,8 +193,9 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
 
     @app.post("/api/auth/login")
     async def login(body: LoginIn, request: Request):
-        key = f"{request.client.host if request.client else '-'}|{body.login.lower()}"
-        throttle(key)
+        ip = request.client.host if request.client else "-"
+        key = "user:" + body.login.strip().lower()
+        throttle(key, ip)
         user = None
         if body.source == "local":
             row = db.one("SELECT * FROM users WHERE login=? AND source='local'", body.login.strip())
@@ -188,7 +208,7 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
             try:
                 adu = await run_in_threadpool(ad_authenticate, ad, vault, body.login, body.password)
             except ADError as e:
-                failures.setdefault(key, []).append(time.monotonic())
+                record_failure(key, ip)
                 log.info("AD: вход %s отклонён: %s", body.login, e)
                 raise HTTPException(401, "Неверный логин или пароль") from None
             row = db.one("SELECT * FROM users WHERE login=?", adu.login)
@@ -205,7 +225,7 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
                        adu.login, adu.name, "ad", role, adu.via_group)
             user = db.one("SELECT * FROM users WHERE login=?", adu.login)
         if not user:
-            failures.setdefault(key, []).append(time.monotonic())
+            record_failure(key, ip)
             raise HTTPException(401, "Неверный логин или пароль")
         if not user["enabled"]:
             raise HTTPException(403, "Учётная запись заблокирована администратором")
@@ -357,6 +377,9 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
 
     @adm.delete("/api/admin/hmcs/{hmc_id}")
     def delete_hmc(hmc_id: int, _: dict = Depends(admin)):
+        request_poll = ctx.poller._running.get(hmc_id)
+        if request_poll and not request_poll.done():
+            request_poll.cancel()
         db.run("DELETE FROM hmcs WHERE id=?", hmc_id)
         return {"ok": True}
 
@@ -407,14 +430,14 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
         losing_admin = row["role"] == "admin" and row["enabled"] and (body.role != "admin" or not body.enabled)
         if losing_admin and _admins_left(uid) == 0:
             raise HTTPException(409, "Нельзя убрать последнего администратора")
-        db.run("UPDATE users SET name=?, role=?, enabled=?, role_locked=? WHERE id=?",
-               body.name.strip(), body.role, int(body.enabled), int(body.role_locked and row["source"] == "ad"), uid)
-        if body.password:
-            if row["source"] != "local":
-                raise HTTPException(422, "Пароль пользователя AD меняется в домене")
-            if len(body.password) < 8:
-                raise HTTPException(422, "Пароль должен быть не короче 8 символов")
-            db.run("UPDATE users SET pw_hash=? WHERE id=?", hash_password(body.password), uid)
+        if body.password and row["source"] != "local":
+            raise HTTPException(422, "Пароль пользователя AD меняется в домене")
+        if body.password and len(body.password) < 8:
+            raise HTTPException(422, "Пароль должен быть не короче 8 символов")
+        new_hash = hash_password(body.password) if body.password else row["pw_hash"]
+        db.run("UPDATE users SET name=?, role=?, enabled=?, role_locked=?, pw_hash=? WHERE id=?",
+               body.name.strip(), body.role, int(body.enabled),
+               int(body.role_locked and row["source"] == "ad"), new_hash, uid)
         return {"ok": True}
 
     @adm.delete("/api/admin/users/{uid}")
@@ -488,7 +511,10 @@ def create_app(ctx: Context, kind: Literal["public", "admin"] = "public") -> Fas
 
 def _bootstrap(db: DB, vault: Vault) -> None:
     if not db.one("SELECT 1 FROM users LIMIT 1"):
-        pw = config.ADMIN_PASSWORD or secrets.token_urlsafe(12)
+        if config.ADMIN_PASSWORD and (len(config.ADMIN_PASSWORD) < 12 or config.ADMIN_PASSWORD.lower() in
+                                      {"change-me", "password", "admin", "пароль-admin"}):
+            raise RuntimeError("HMCSCAN_ADMIN_PASSWORD must be at least 12 characters and not a placeholder")
+        pw = config.ADMIN_PASSWORD or secrets.token_urlsafe(18)
         db.run("INSERT INTO users(login,name,source,role,pw_hash) VALUES('admin','Встроенный администратор','local','admin',?)",
                hash_password(pw))
         if config.ADMIN_PASSWORD:
