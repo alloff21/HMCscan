@@ -6,14 +6,14 @@ services:
     restart: unless-stopped
     ports:
       - "8843:8843"   # просмотр (только чтение)
-      - "8844:8844"   # администрирование; можно открыть только для себя: "127.0.0.1:8844:8844"
+      - "127.0.0.1:8844:8844"   # администрирование; можно открыть только для себя: "127.0.0.1:8844:8844"
     volumes:
       - hmcscan-data:/data
     environment:
       # Key that encrypts stored HMC and AD passwords. Set it once and keep it.
-      HMCSCAN_SECRET_KEY: "change-me-to-a-long-random-string"
+      HMCSCAN_SECRET_KEY: "${HMCSCAN_SECRET_KEY:?Set a strong HMCSCAN_SECRET_KEY in your environment}"
       # Password of the built-in "admin" user on the first start.
-      HMCSCAN_ADMIN_PASSWORD: "change-me"
+      HMCSCAN_ADMIN_PASSWORD: "${HMCSCAN_ADMIN_PASSWORD:?Set a strong HMCSCAN_ADMIN_PASSWORD in your environment}"
       TZ: Europe/Moscow
       # HMCSCAN_DEMO: "1"   # fake HMCs with test data, to try the UI
 
