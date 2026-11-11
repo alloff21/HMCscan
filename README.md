@@ -18,8 +18,8 @@ docker run -d --name hmcscan --restart unless-stopped \
   -p 8843:8843 \
   -p 8844:8844 \
   -v hmcscan-data:/data \
-  -e HMCSCAN_SECRET_KEY='длинная-случайная-строка' \
-  -e HMCSCAN_ADMIN_PASSWORD='пароль-admin' \
+  -e HMCSCAN_SECRET_KEY="$(openssl rand -hex 32)" \
+  -e HMCSCAN_ADMIN_PASSWORD="$(openssl rand -hex 24)" \
   ghcr.io/alloff21/hmcscan:latest
 ```
 
@@ -100,3 +100,11 @@ pip install -r requirements-dev.txt
 python -m pytest
 HMCSCAN_DATA_DIR=./data HMCSCAN_TLS=0 HMCSCAN_DEMO=1 python -m app   # просмотр http://localhost:8843, администрирование http://localhost:8844
 ```
+
+### Безопасное развёртывание
+
+- Не публикуйте порт 8844 в недоверенных сетях: в Compose он привязан к `127.0.0.1`. Для удалённого доступа используйте VPN или SSH-туннель.
+- Перед `docker compose up` задайте `HMCSCAN_SECRET_KEY` (случайная строка от 32 символов) и `HMCSCAN_ADMIN_PASSWORD` (от 12 символов) в окружении или защищённом `.env`. Не коммитьте `.env` в Git.
+- Для HMC и Active Directory выбирайте `verify` или `ca`, а не `none`. Используйте доверенный сертификат для веб-интерфейса.
+- При обновлении уже существующего экземпляра сохраняйте прежний `HMCSCAN_SECRET_KEY`: изменение ключа сделает зашифрованные пароли недоступными.
+- При работе за reverse proxy передавайте корректный `Host` и используйте HTTPS: приложение проверяет заголовок `Origin` для изменяющих API-запросов.
