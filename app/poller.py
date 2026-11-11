@@ -53,7 +53,7 @@ class Poller:
 
     def trigger(self, hmc_id: int) -> bool:
         """Start a poll now unless one is already running. Returns True if started."""
-        if self.is_running(hmc_id):
+        if self.is_running(hmc_id) or not self.db.one("SELECT 1 FROM hmcs WHERE id=? AND enabled=1", hmc_id):
             return False
         self._running[hmc_id] = asyncio.create_task(self._guarded(hmc_id))
         return True
@@ -83,7 +83,7 @@ class Poller:
             await self.poll(hmc_id)
 
     async def poll(self, hmc_id: int) -> dict | None:
-        h = self.db.one("SELECT * FROM hmcs WHERE id=?", hmc_id)
+        h = self.db.one("SELECT * FROM hmcs WHERE id=? AND enabled=1", hmc_id)
         if not h:
             return None
         attempted = now_iso()
@@ -98,7 +98,7 @@ class Poller:
             return None
         except Exception as e:  # unexpected parser or network problem: record it, keep the old data
             log.exception("Опрос %s: непредвиденная ошибка", h["name"])
-            self.db.run("UPDATE snapshots SET status='err', error=? WHERE hmc_id=?", f"Внутренняя ошибка: {e}", hmc_id)
+            self.db.run("UPDATE snapshots SET status='err', error=? WHERE hmc_id=?", "Внутренняя ошибка опроса (подробности в логах)", hmc_id)
             return None
         status = "warn" if data["warnings"] else "ok"
         self.db.run("UPDATE snapshots SET status=?, error=?, polled_at=?, duration_s=?, data=? WHERE hmc_id=?",
